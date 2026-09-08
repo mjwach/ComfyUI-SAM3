@@ -14,13 +14,12 @@ function hideWidgetForGood(node, widget, suffix = '') {
     if (!widget) return;
 
     // Save original properties
-    widget.origType = widget.type;
     widget.origComputeSize = widget.computeSize;
-    widget.origSerializeValue = widget.serializeValue;
+    widget.origDraw = widget.draw;
 
     // Multiple hiding approaches to ensure widget is fully hidden
     widget.computeSize = () => [0, -4];  // -4 compensates for litegraph's automatic widget gap
-    widget.type = "converted-widget" + suffix;
+    widget.draw = () => {};
     widget.hidden = true;  // Mark as hidden
 
     // IMPORTANT: Keep serialization enabled so values are sent to backend
@@ -135,8 +134,9 @@ app.registerExtension({
                 const coordsWidget = this.widgets.find(w => w.name === "coordinates");
                 const negCoordsWidget = this.widgets.find(w => w.name === "neg_coordinates");
                 const storeWidget = this.widgets.find(w => w.name === "points_store");
+                const bgImageWidget = this.widgets.find(w => w.name === "bg_image_filename");
 
-                console.log("[SAM3] Found widgets to hide:", { coordsWidget, negCoordsWidget, storeWidget });
+                console.log("[SAM3] Found widgets to hide:", { coordsWidget, negCoordsWidget, storeWidget, bgImageWidget });
 
                 // Initialize default values BEFORE hiding
                 if (coordsWidget) {
@@ -148,12 +148,16 @@ app.registerExtension({
                 if (storeWidget) {
                     storeWidget.value = storeWidget.value || "{}";
                 }
+                if (bgImageWidget) {
+                    bgImageWidget.value = bgImageWidget.value || "";
+                }
 
                 // Store references before hiding
                 this._hiddenWidgets = {
                     coordinates: coordsWidget,
                     neg_coordinates: negCoordsWidget,
-                    points_store: storeWidget
+                    points_store: storeWidget,
+                    bg_image_filename: bgImageWidget
                 };
 
                 // Apply hiding
@@ -169,25 +173,10 @@ app.registerExtension({
                     hideWidgetForGood(this, storeWidget);
                     console.log("[SAM3] points_store - type:", storeWidget.type, "hidden:", storeWidget.hidden, "value:", storeWidget.value);
                 }
-
-                // CRITICAL FIX: Override onDrawForeground to skip rendering hidden widgets
-                const originalDrawForeground = this.onDrawForeground;
-                this.onDrawForeground = function(ctx) {
-                    // Temporarily hide converted widgets from rendering
-                    const hiddenWidgets = this.widgets.filter(w => w.type?.includes("converted-widget"));
-                    const originalTypes = hiddenWidgets.map(w => w.type);
-
-                    // Temporarily set to null to prevent rendering
-                    hiddenWidgets.forEach(w => w.type = null);
-
-                    // Call original draw
-                    if (originalDrawForeground) {
-                        originalDrawForeground.apply(this, arguments);
-                    }
-
-                    // Restore types
-                    hiddenWidgets.forEach((w, i) => w.type = originalTypes[i]);
-                };
+                if (bgImageWidget) {
+                    hideWidgetForGood(this, bgImageWidget);
+                    console.log("[SAM3] bg_image_filename - type:", bgImageWidget.type, "hidden:", bgImageWidget.hidden, "value:", storeWidget.value);
+                }
 
                 console.log("[SAM3] Widgets after hiding:", this.widgets.map(w => `${w.name}(${w.type})`));
                 console.log("[SAM3] All widgets processing complete");
@@ -276,6 +265,13 @@ app.registerExtension({
                             this.redrawCanvas();
                         };
                         img.src = "data:image/jpeg;base64," + message.bg_image[0];
+                    }
+
+                    if (message.bg_image_filename && message.bg_image_filename[0] !== undefined) {
+                        const filenameWidget = this._hiddenWidgets?.bg_image_filename;
+                        if (filenameWidget) {
+                            filenameWidget.value = message.bg_image_filename[0];
+                        }
                     }
                 };
 
@@ -420,6 +416,41 @@ app.registerExtension({
                     ctx.lineWidth = 2;
                     ctx.stroke();
                 }
+            };
+
+            const onConfigure = nodeType.prototype.onConfigure;
+            nodeType.prototype.onConfigure = function (info) {
+                onConfigure?.apply(this, arguments);
+
+                const filenameWidget = this._hiddenWidgets?.bg_image_filename;
+                if (filenameWidget?.value) {
+                    const img = new Image();
+                    img.onload = () => {
+                        this.canvasWidget.image = img;
+                        this.canvasWidget.canvas.width = img.width;
+                        this.canvasWidget.canvas.height = img.height;
+                        this.redrawCanvas();
+                    };
+                    img.onerror = () => { /* file gone — leave the placeholder, don't throw */ };
+                    img.src = `/view?filename=${encodeURIComponent(filenameWidget.value)}&type=input&subfolder=`;
+                }
+
+                const coordsWidget = this._hiddenWidgets?.coordinates;
+                const negCoordsWidget = this._hiddenWidgets?.neg_coordinates;
+
+                try {
+                    this.canvasWidget.positivePoints = coordsWidget?.value ? JSON.parse(coordsWidget.value) : [];
+                } catch (e) {
+                    this.canvasWidget.positivePoints = [];
+                }
+                try {
+                    this.canvasWidget.negativePoints = negCoordsWidget?.value ? JSON.parse(negCoordsWidget.value) : [];
+                } catch (e) {
+                    this.canvasWidget.negativePoints = [];
+                }
+
+                this.updatePoints();
+                this.redrawCanvas();
             };
         }
     }

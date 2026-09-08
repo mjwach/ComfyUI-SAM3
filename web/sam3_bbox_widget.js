@@ -14,13 +14,12 @@ function hideWidgetForGood(node, widget, suffix = '') {
     if (!widget) return;
 
     // Save original properties
-    widget.origType = widget.type;
     widget.origComputeSize = widget.computeSize;
-    widget.origSerializeValue = widget.serializeValue;
+    widget.origDraw = widget.draw;
 
     // Multiple hiding approaches to ensure widget is fully hidden
     widget.computeSize = () => [0, -4];  // -4 compensates for litegraph's automatic widget gap
-    widget.type = "converted-widget" + suffix;
+    widget.draw = () => {};
     widget.hidden = true;  // Mark as hidden
 
     // IMPORTANT: Keep serialization enabled so values are sent to backend
@@ -137,8 +136,9 @@ app.registerExtension({
 
                 const bboxesWidget = this.widgets.find(w => w.name === "bboxes");
                 const negBboxesWidget = this.widgets.find(w => w.name === "neg_bboxes");
+                const bgImageWidget = this.widgets.find(w => w.name === "bg_image_filename");
 
-                console.log("[SAM3] Found widgets to hide:", { bboxesWidget, negBboxesWidget });
+                console.log("[SAM3] Found widgets to hide:", { bboxesWidget, negBboxesWidget, bgImageWidget });
 
                 // Initialize default values BEFORE hiding
                 if (bboxesWidget) {
@@ -147,11 +147,15 @@ app.registerExtension({
                 if (negBboxesWidget) {
                     negBboxesWidget.value = negBboxesWidget.value || "[]";
                 }
+                if (bgImageWidget) {
+                    bgImageWidget.value = bgImageWidget.value || "";
+                }
 
                 // Store references before hiding
                 this._hiddenWidgets = {
                     bboxes: bboxesWidget,
-                    neg_bboxes: negBboxesWidget
+                    neg_bboxes: negBboxesWidget,
+                    bg_image_filename: bgImageWidget
                 };
 
                 // Apply hiding
@@ -163,31 +167,10 @@ app.registerExtension({
                     hideWidgetForGood(this, negBboxesWidget);
                     console.log("[SAM3] neg_bboxes - type:", negBboxesWidget.type, "hidden:", negBboxesWidget.hidden, "value:", negBboxesWidget.value);
                 }
-
-                // CRITICAL FIX: Override onDrawForeground to skip rendering hidden widgets
-                const originalDrawForeground = this.onDrawForeground;
-                this.onDrawForeground = function(ctx) {
-                    // Temporarily hide converted widgets from rendering
-                    const hiddenWidgets = this.widgets.filter(w => w.type?.includes("converted-widget"));
-                    const originalTypes = hiddenWidgets.map(w => w.type);
-
-                    // Temporarily set to null to prevent rendering
-                    hiddenWidgets.forEach(w => w.type = null);
-
-                    // Call original draw
-                    if (originalDrawForeground) {
-                        originalDrawForeground.apply(this, arguments);
-                    }
-
-                    // Restore types
-                    hiddenWidgets.forEach((w, i) => w.type = originalTypes[i]);
-
-                    // Update container height based on current node size
-                    const containerHeight = Math.max(200, this.size[1] - 80);
-                    if (container.style.height !== containerHeight + "px") {
-                        container.style.height = containerHeight + "px";
-                    }
-                };
+                if (bgImageWidget) {
+                    hideWidgetForGood(this, bgImageWidget);
+                    console.log("[SAM3] bg_image_filename - type:", bgImageWidget.type, "hidden:", bgImageWidget.hidden, "value:", bgImageWidget.value);
+                }
 
                 console.log("[SAM3] Widgets after hiding:", this.widgets.map(w => `${w.name}(${w.type})`));
                 console.log("[SAM3] All widgets processing complete");
@@ -309,6 +292,13 @@ app.registerExtension({
                             this.redrawCanvas();
                         };
                         img.src = "data:image/jpeg;base64," + message.bg_image[0];
+                    }
+
+                    if (message.bg_image_filename && message.bg_image_filename[0] !== undefined) {
+                        const filenameWidget = this._hiddenWidgets?.bg_image_filename;
+                        if (filenameWidget) {
+                            filenameWidget.value = message.bg_image_filename[0];
+                        }
                     }
                 };
 
@@ -486,6 +476,41 @@ app.registerExtension({
                     }
                     ctx.fillRect(currentBBox.bbox.x1, currentBBox.bbox.y1, width, height);
                 }
+            };
+
+            const onConfigure = nodeType.prototype.onConfigure;
+            nodeType.prototype.onConfigure = function (info) {
+                onConfigure?.apply(this, arguments);
+
+                const filenameWidget = this._hiddenWidgets?.bg_image_filename;
+                if (filenameWidget?.value) {
+                    const img = new Image();
+                    img.onload = () => {
+                        this.canvasWidget.image = img;
+                        this.canvasWidget.canvas.width = img.width;
+                        this.canvasWidget.canvas.height = img.height;
+                        this.redrawCanvas();
+                    };
+                    img.onerror = () => { /* file gone — leave the placeholder, don't throw */ };
+                    img.src = `/view?filename=${encodeURIComponent(filenameWidget.value)}&type=input&subfolder=`;
+                }
+
+                const bboxesWidget = this._hiddenWidgets?.bboxes;
+                const negBboxesWidget = this._hiddenWidgets?.neg_bboxes;
+
+                try {
+                    this.canvasWidget.positiveBBoxes = bboxesWidget?.value ? JSON.parse(bboxesWidget.value) : [];
+                } catch (e) {
+                    this.canvasWidget.positiveBBoxes = [];
+                }
+                try {
+                    this.canvasWidget.negativeBBoxes = negBboxesWidget?.value ? JSON.parse(negBboxesWidget.value) : [];
+                } catch (e) {
+                    this.canvasWidget.negativeBBoxes = [];
+                }
+
+                this.updateBBoxes();
+                this.redrawCanvas();
             };
         }
     }

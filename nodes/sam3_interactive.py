@@ -21,6 +21,9 @@ from PIL import Image
 
 import comfy.utils
 
+import os
+import folder_paths
+
 from comfy_api.latest import io
 
 from .utils import comfy_image_to_pil, visualize_masks_on_image, masks_to_comfy_mask, pil_to_comfy_image
@@ -35,6 +38,25 @@ _INTERACTIVE_CACHE = {}
 # Serializes GPU work from parallel per-prompt requests
 _SEGMENT_LOCK = threading.Lock()
 
+_BG_IMAGE_PREFIX = "sam3_collector_bg_"
+
+def _save_reference_image(img_base64):
+    """Content-addressed write to the ComfyUI input folder.
+    Shared across all SAM3 collector nodes so their saved previews carry one
+    common, easily identifiable filename prefix. Returns '' on failure.
+    """
+    try:
+        img_bytes = base64.b64decode(img_base64)
+        img_hash = hashlib.md5(img_bytes).hexdigest()[:16]
+        filename = f"{_BG_IMAGE_PREFIX}{img_hash}.jpg"
+        filepath = os.path.join(folder_paths.get_input_directory(), filename)
+        if not os.path.exists(filepath):
+            with open(filepath, "wb") as f:
+                f.write(img_bytes)
+        return filename
+    except OSError as e:
+        log.warning(f"SAM3 collector: could not save reference image: {e}")
+        return ""
 
 class SAM3PointCollector(io.ComfyNode):
     """
@@ -62,6 +84,16 @@ class SAM3PointCollector(io.ComfyNode):
                 io.String.Input("points_store", multiline=False, default="{}"),
                 io.String.Input("coordinates", multiline=False, default="[]"),
                 io.String.Input("neg_coordinates", multiline=False, default="[]"),
+                io.String.Input("bg_image_filename", multiline=False, default=""),
+                io.Boolean.Input(
+                    "save_reference_image",
+                    default=True,
+                    tooltip="Save the reference image shown in the canvas to the ComfyUI input folder, "
+                            "so it's still there when you reopen this workflow. Turn off if you'd rather "
+                            "this node not write files to disk. Note that all input files created by this "
+                            "node will have the prefix " + _BG_IMAGE_PREFIX + ", so you should be able to "
+                            "quickly manually delete them at any time."
+                ),
             ],
             outputs=[
                 io.Custom("SAM3_POINTS_PROMPT").Output(display_name="positive_points"),
@@ -74,6 +106,13 @@ class SAM3PointCollector(io.ComfyNode):
         image = kwargs.get("image")
         coordinates = kwargs.get("coordinates")
         neg_coordinates = kwargs.get("neg_coordinates")
+
+        if image is None or coordinates is None or neg_coordinates is None:
+            # Called as a caching pre-check before this node's real inputs are
+            # resolved (e.g. upstream link not yet available this pass).
+            # Force a fresh execute() instead of crashing.
+            return float("nan")
+
         # Return hash based on actual point content, not object identity
         # This ensures downstream nodes don't re-run when points haven't changed
         import hashlib
@@ -87,7 +126,8 @@ class SAM3PointCollector(io.ComfyNode):
         return result
 
     @classmethod
-    def execute(cls, image, points_store, coordinates, neg_coordinates):
+    def execute(cls, image, points_store, coordinates, neg_coordinates,
+                bg_image_filename="", save_reference_image=True):
         """
         Collect points from interactive canvas
 
@@ -96,6 +136,7 @@ class SAM3PointCollector(io.ComfyNode):
             points_store: Combined JSON storage (hidden widget)
             coordinates: Positive points JSON (hidden widget)
             neg_coordinates: Negative points JSON (hidden widget)
+            save_reference_image: Whether to save the collection area's background image as a file (hidden widget)
 
         Returns:
             Tuple of (positive_points, negative_points) as separate SAM3_POINTS_PROMPT outputs
@@ -108,13 +149,14 @@ class SAM3PointCollector(io.ComfyNode):
         h.update(neg_coordinates.encode())
         cache_key = h.hexdigest()
 
-        # Check if we have cached result
+        img_base64 = cls._tensor_to_base64(image)
+        bg_filename = _save_reference_image(img_base64) if save_reference_image else ""
+        ui_payload = {"bg_image": [img_base64], "bg_image_filename": [bg_filename]}
+
         if cache_key in SAM3PointCollector._cache:
             cached = SAM3PointCollector._cache[cache_key]
             log.info(f"CACHE HIT - returning cached result for key={cache_key[:8]}")
-            # Still need to return UI update
-            img_base64 = cls._tensor_to_base64(image)
-            return io.NodeOutput(cached[0], cached[1], ui={"bg_image": [img_base64]})
+            return io.NodeOutput(cached[0], cached[1], ui=ui_payload)
 
         log.info(f"CACHE MISS - computing new result for key={cache_key[:8]}")
 
@@ -157,11 +199,7 @@ class SAM3PointCollector(io.ComfyNode):
 
         # Cache the result
         SAM3PointCollector._cache[cache_key] = (positive_points, negative_points)
-
-        # Send image back to widget as base64
-        img_base64 = cls._tensor_to_base64(image)
-
-        return io.NodeOutput(positive_points, negative_points, ui={"bg_image": [img_base64]})
+        return io.NodeOutput(positive_points, negative_points, ui=ui_payload)
 
     @staticmethod
     def _tensor_to_base64(tensor):
@@ -207,6 +245,16 @@ class SAM3BBoxCollector(io.ComfyNode):
                                tooltip="Image to display in interactive canvas. Click and drag to draw positive bboxes (cyan), Shift+Click/Right-click and drag to draw negative bboxes (red). Bounding boxes are automatically normalized to image dimensions."),
                 io.String.Input("bboxes", multiline=False, default="[]"),
                 io.String.Input("neg_bboxes", multiline=False, default="[]"),
+                io.String.Input("bg_image_filename", multiline=False, default=""),
+                io.Boolean.Input(
+                    "save_reference_image",
+                    default=True,
+                    tooltip="Save the reference image shown in the canvas to the ComfyUI input folder, "
+                            "so it's still there when you reopen this workflow. Turn off if you'd rather "
+                            "this node not write files to disk. Note that all input files created by this "
+                            "node will have the prefix " + _BG_IMAGE_PREFIX + ", so you should be able to "
+                            "quickly manually delete them at any time."
+                ),
             ],
             outputs=[
                 io.Custom("SAM3_BOXES_PROMPT").Output(display_name="positive_bboxes"),
@@ -219,6 +267,13 @@ class SAM3BBoxCollector(io.ComfyNode):
         image = kwargs.get("image")
         bboxes = kwargs.get("bboxes")
         neg_bboxes = kwargs.get("neg_bboxes")
+
+        if image is None or bboxes is None or neg_bboxes is None:
+            # Called as a caching pre-check before this node's real inputs are
+            # resolved (e.g. upstream link not yet available this pass).
+            # Force a fresh execute() instead of crashing.
+            return float("nan")
+
         # Return hash based on actual bbox content, not object identity
         # This ensures downstream nodes don't re-run when bboxes haven't changed
         import hashlib
@@ -232,7 +287,8 @@ class SAM3BBoxCollector(io.ComfyNode):
         return result
 
     @classmethod
-    def execute(cls, image, bboxes, neg_bboxes):
+    def execute(cls, image, bboxes, neg_bboxes,
+                bg_image_filename="", save_reference_image=True):
         """
         Collect bounding boxes from interactive canvas
 
@@ -240,6 +296,7 @@ class SAM3BBoxCollector(io.ComfyNode):
             image: ComfyUI image tensor [B, H, W, C]
             bboxes: Positive BBoxes JSON array (hidden widget)
             neg_bboxes: Negative BBoxes JSON array (hidden widget)
+            save_reference_image: Whether to save the collection area's background image as a file (hidden widget)
 
         Returns:
             Tuple of (positive_bboxes, negative_bboxes) as separate SAM3_BOXES_PROMPT outputs
@@ -252,13 +309,15 @@ class SAM3BBoxCollector(io.ComfyNode):
         h.update(neg_bboxes.encode())
         cache_key = h.hexdigest()
 
+        img_base64 = cls._tensor_to_base64(image)
+        bg_filename = _save_reference_image(img_base64) if save_reference_image else ""
+        ui_payload = {"bg_image": [img_base64], "bg_image_filename": [bg_filename]}
+
         # Check if we have cached result
         if cache_key in SAM3BBoxCollector._cache:
             cached = SAM3BBoxCollector._cache[cache_key]
             log.info(f"CACHE HIT - returning cached result for key={cache_key[:8]}")
-            # Still need to return UI update
-            img_base64 = cls._tensor_to_base64(image)
-            return io.NodeOutput(cached[0], cached[1], ui={"bg_image": [img_base64]})
+            return io.NodeOutput(cached[0], cached[1], ui=ui_payload)
 
         log.info(f"CACHE MISS - computing new result for key={cache_key[:8]}")
 
@@ -335,10 +394,7 @@ class SAM3BBoxCollector(io.ComfyNode):
         # Cache the result
         SAM3BBoxCollector._cache[cache_key] = (positive_prompt, negative_prompt)
 
-        # Send image back to widget as base64
-        img_base64 = cls._tensor_to_base64(image)
-
-        return io.NodeOutput(positive_prompt, negative_prompt, ui={"bg_image": [img_base64]})
+        return io.NodeOutput(positive_prompt, negative_prompt, ui=ui_payload)
 
     @staticmethod
     def _tensor_to_base64(tensor):
