@@ -906,10 +906,45 @@ def _api_segment_one(body: dict) -> dict:
         return {"error": str(exc), "_status": 500}
 
 
+def _api_save_reference_image(body: dict) -> dict:
+    """Persist a canvas reference image to the ComfyUI input folder on demand
+    (called via IPC). Lets the point/bbox collector widgets save the image
+    the moment "save_reference_image" is turned on, instead of only on the
+    next full execute() -- so the file (and this node's stored filename)
+    are correct even if the UI is reloaded before the node runs again.
+    """
+    img_base64 = body.get("image", "")
+    if not img_base64:
+        return {"error": "No image provided", "_status": 400}
+
+    filename = _save_reference_image(img_base64)
+    if not filename:
+        return {"error": "Could not save reference image", "_status": 500}
+    return {"filename": filename}
+
+
 # Declare routes for comfy-env proxy registration
 ROUTES = [
     {"method": "POST", "path": "/sam3/interactive_segment_one", "handler": "_api_segment_one"},
 ]
+
+try:
+    from server import PromptServer
+    from aiohttp import web as _aiohttp_web
+
+    @PromptServer.instance.routes.post("/sam3/save_reference_image")
+    async def _route_save_reference_image(request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        result = _api_save_reference_image(body)
+        status = result.pop("_status", 200)
+        return _aiohttp_web.json_response(result, status=status)
+
+    log.info("SAM3: registered /sam3/save_reference_image directly on PromptServer")
+except Exception as exc:
+    log.warning(f"SAM3: could not register /sam3/save_reference_image directly on PromptServer: {exc}")
 
 
 # Node mappings for ComfyUI registration

@@ -172,6 +172,22 @@ app.registerExtension({
                     console.log("[SAM3] bg_image_filename - type:", bgImageWidget.type, "hidden:", bgImageWidget.hidden, "value:", bgImageWidget.value);
                 }
 
+                // If the user flips "save_reference_image" on after having run with it
+                // off, persist whatever's currently on the canvas right away -- don't
+                // make them requeue the node just to get the file (and this widget's
+                // value) in sync before they save the workflow.
+                const saveToggleWidget = this.widgets.find(w => w.name === "save_reference_image");
+                if (saveToggleWidget) {
+                    const originalToggleCallback = saveToggleWidget.callback;
+                    saveToggleWidget.callback = (value, ...args) => {
+                        const result = originalToggleCallback?.apply(saveToggleWidget, [value, ...args]);
+                        if (value) {
+                            this.persistReferenceImageIfNeeded();
+                        }
+                        return result;
+                    };
+                }
+
                 console.log("[SAM3] Widgets after hiding:", this.widgets.map(w => `${w.name}(${w.type})`));
                 console.log("[SAM3] All widgets processing complete");
 
@@ -282,6 +298,7 @@ app.registerExtension({
                 this.onExecuted = (message) => {
                     console.log("[SAM3] onExecuted called with message:", message);
                     if (message.bg_image && message.bg_image[0]) {
+                        this.canvasWidget.imageBase64 = message.bg_image[0];
                         const img = new Image();
                         img.onload = () => {
                             console.log(`[SAM3] Image loaded: ${img.width}x${img.height}`);
@@ -342,6 +359,37 @@ app.registerExtension({
                 console.log("[SAM3] Node size set to:", [nodeWidth, nodeHeight]);
                 console.log("[SAM3] onNodeCreated complete");
                 return result;
+            };
+
+            // Helper: Persist the currently-displayed canvas image on demand, without
+            // requiring a full queued run. Used when "save_reference_image" is turned
+            // on after a run that had it off, so the saved file (and this node's
+            // stored filename) are ready even if the whole UI gets reloaded before
+            // the node executes again.
+            nodeType.prototype.persistReferenceImageIfNeeded = async function () {
+                const filenameWidget = this._hiddenWidgets?.bg_image_filename;
+                if (!filenameWidget) return;
+                if (filenameWidget.value) return;  // already saved
+
+                const imageBase64 = this.canvasWidget?.imageBase64;
+                if (!imageBase64) return;  // nothing displayed yet to save
+
+                try {
+                    const response = await fetch("/sam3/save_reference_image", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ image: imageBase64 }),
+                    });
+                    const result = await response.json();
+                    if (result && result.filename) {
+                        filenameWidget.value = result.filename;
+                        console.log("[SAM3] Persisted reference image on toggle:", result.filename);
+                    } else {
+                        console.warn("[SAM3] Could not persist reference image:", result);
+                    }
+                } catch (e) {
+                    console.warn("[SAM3] Failed to persist reference image:", e);
+                }
             };
 
             // Helper: Find bbox at coordinates
