@@ -207,7 +207,7 @@ def connected_components(input_tensor: torch.Tensor):
     ), "Input tensor must be (B, H, W) or (B, 1, H, W)."
 
     if input_tensor.is_cuda:
-        if HAS_CC_TORCH:
+        if HAS_CC_TORCH and False:
             return get_connected_components(input_tensor.to(torch.uint8))
         else:
             logging.debug("GPU connected components not available, using CPU fallback")

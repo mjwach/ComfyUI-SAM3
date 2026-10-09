@@ -9,7 +9,7 @@ Key design principles:
 1. All state is immutable (frozen dataclasses)
 2. Adding prompts returns a NEW state (doesn't mutate)
 3. Inference state is reconstructed on-demand
-4. Temp directories are automatically cleaned up via atexit
+4. Frame directories live on disk, capped by total size (see create_session_frames)
 """
 import logging
 import os
@@ -17,6 +17,7 @@ import uuid
 import shutil
 import tempfile
 import weakref
+from collections import OrderedDict
 import atexit
 from dataclasses import dataclass, field
 from typing import Tuple, Optional, Dict, Any, List
@@ -26,23 +27,90 @@ log = logging.getLogger("sam3")
 
 
 # =============================================================================
-# Auto-cleanup registry for temporary directories
+# Session frame directories: on real disk, capped by total size
 # =============================================================================
+#
+# Each run of SAM3 Video Segmentation extracts its frames as JPEGs into a
+# fresh, uniquely named directory of its own.  Nothing is ever identified by
+# content: ComfyUI's own caching decides when the node re-runs, and a session
+# can only ever read the directory it created, so it can't get another
+# session's frames.
+#
+# These directories used to go into tempfile.gettempdir() (usually /tmp, RAM
+# on many distros), were kept until process exit, and were orphaned forever
+# after a crash.  Now:
+#   * they live under SAM3_TEMP_DIR, default ~/.cache/comfyui-sam3 (real disk);
+#   * their total size is capped at SAM3_FRAME_CACHE_GB (default 10 GB): when
+#     a new session pushes the total over the cap, the least recently used
+#     sessions are deleted (the newest one is always kept);
+#   * leftovers from earlier runs are deleted the first time the root is used.
 
-_TEMP_DIR_REGISTRY = set()
+_SESSIONS = OrderedDict()       # session_uuid -> {"dir", "bytes"}, least recently used first
+_EVICTION_LISTENERS = []        # callables(session_uuid) run when a session's frames go away
+_ROOT = None
 _CLEANUP_REGISTERED = False
+_DIR_PREFIX = "sam3_"
+
+
+def frame_cache_limit_bytes() -> int:
+    try:
+        gb = float(os.environ.get("SAM3_FRAME_CACHE_GB", "10"))
+    except ValueError:
+        gb = 10.0
+    return int(max(gb, 0.0) * 1024**3)
+
+
+def _temp_root() -> str:
+    """Dedicated root for SAM3 scratch data; stale contents purged on first use."""
+    global _ROOT
+    if _ROOT is None:
+        root = os.environ.get("SAM3_TEMP_DIR") or os.path.join(
+            os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+            "comfyui-sam3",
+        )
+        os.makedirs(root, exist_ok=True)
+        # Everything under this root belongs to SAM3, so anything present now
+        # was left behind by an earlier (possibly crashed) ComfyUI run.
+        for name in os.listdir(root):
+            if name.startswith(_DIR_PREFIX):
+                path = os.path.join(root, name)
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+                log.info(f"Removed stale SAM3 scratch item: {name}")
+        _ROOT = root
+        log.info(f"SAM3 video frame cache: {root} "
+                 f"(limit {frame_cache_limit_bytes() / 1024**3:.1f} GB)")
+    return _ROOT
+
+
+def register_eviction_listener(fn):
+    """fn(session_uuid) is called just before a session's frames are deleted,
+    so caches that refer to the session can drop their entries."""
+    _EVICTION_LISTENERS.append(fn)
+
+
+def _drop_session(session_uuid: str):
+    entry = _SESSIONS.pop(session_uuid, None)
+    for fn in _EVICTION_LISTENERS:
+        try:
+            fn(session_uuid)
+        except Exception as e:
+            log.warning(f"SAM3 session eviction hook failed: {e}")
+    if entry:
+        shutil.rmtree(entry["dir"], ignore_errors=True)
+        log.info(f"Discarded frames of video session {session_uuid[:8]} "
+                 f"({entry['bytes'] / 1024**2:.0f} MB)")
 
 
 def _cleanup_temp_dirs():
-    """Clean up all registered temporary directories at process exit."""
-    for path in list(_TEMP_DIR_REGISTRY):
-        try:
-            if os.path.exists(path):
-                shutil.rmtree(path, ignore_errors=True)
-                log.info(f"Cleaned up temp dir: {path}")
-        except Exception as e:
-            log.warning(f"Failed to cleanup {path}: {e}")
-    _TEMP_DIR_REGISTRY.clear()
+    """Clean up all session directories at process exit."""
+    for session_uuid in list(_SESSIONS):
+        _drop_session(session_uuid)
 
 
 def _ensure_cleanup_registered():
@@ -53,40 +121,74 @@ def _ensure_cleanup_registered():
         _CLEANUP_REGISTERED = True
 
 
-def create_temp_dir(session_uuid: str) -> str:
+def _dir_bytes(path: str) -> int:
+    total = 0
+    for entry in os.scandir(path):
+        if entry.is_file(follow_symlinks=False):
+            total += entry.stat(follow_symlinks=False).st_size
+    return total
+
+
+def create_session_frames(session_uuid: str, extract_fn) -> str:
     """
-    Create a temporary directory for video frames with auto-cleanup.
+    Create the frame directory for a new session and fill it.
 
-    The directory is registered for automatic cleanup at process exit,
-    even if the session is never explicitly closed.
-
-    Args:
-        session_uuid: Session identifier for naming
-
-    Returns:
-        Path to the created temporary directory
+    extract_fn(dir) must write 00000.jpg, 00001.jpg, ... into dir.  If it
+    fails or is cancelled, the directory is removed and nothing is recorded.
+    Only after it succeeds are older sessions evicted to respect the size cap,
+    so a cancelled run never costs other node chains their frames.
     """
     _ensure_cleanup_registered()
-    temp_dir = tempfile.mkdtemp(prefix=f"sam3_{session_uuid[:8]}_")
-    _TEMP_DIR_REGISTRY.add(temp_dir)
+    temp_dir = tempfile.mkdtemp(prefix=f"{_DIR_PREFIX}{session_uuid[:8]}_", dir=_temp_root())
+    try:
+        extract_fn(temp_dir)
+    except BaseException:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+    _SESSIONS[session_uuid] = {"dir": temp_dir, "bytes": _dir_bytes(temp_dir)}
+
+    limit = frame_cache_limit_bytes()
+    total = sum(e["bytes"] for e in _SESSIONS.values())
+    while total > limit and len(_SESSIONS) > 1:
+        oldest = next(iter(_SESSIONS))
+        if oldest == session_uuid:
+            break
+        total -= _SESSIONS[oldest]["bytes"]
+        _drop_session(oldest)
     return temp_dir
 
 
+def touch_session(session_uuid: str):
+    """Mark a session as recently used (it is then evicted last)."""
+    if session_uuid in _SESSIONS:
+        _SESSIONS.move_to_end(session_uuid)
+
+
 def cleanup_temp_dir(temp_dir: str):
-    """
-    Explicitly cleanup a temporary directory.
-
-    Also removes it from the registry to avoid double cleanup.
-
-    Args:
-        temp_dir: Path to cleanup
-    """
+    """Explicitly discard the session that owns temp_dir."""
+    for session_uuid, entry in list(_SESSIONS.items()):
+        if entry["dir"] == temp_dir:
+            _drop_session(session_uuid)
+            return
     try:
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir, ignore_errors=True)
     except Exception:
         pass
-    _TEMP_DIR_REGISTRY.discard(temp_dir)
+
+
+def require_session_frames(video_state) -> None:
+    """Raise a clear error if this state's frames were already discarded;
+    otherwise mark the session as recently used."""
+    if not os.path.isdir(video_state.temp_dir):
+        raise RuntimeError(
+            f"[SAM3 Video] The frames for video session {video_state.session_uuid[:8]} "
+            f"were discarded because the frame cache exceeded its size limit "
+            f"({frame_cache_limit_bytes() / 1024**3:.1f} GB). Re-run the SAM3 Video "
+            f"Segmentation node (e.g. tweak one of its inputs), or raise the limit "
+            f"with the environment variable SAM3_FRAME_CACHE_GB."
+        )
+    touch_session(video_state.session_uuid)
 
 
 # =============================================================================
@@ -321,9 +423,8 @@ def create_video_state(
 
     This function:
     1. Generates a unique session UUID
-    2. Creates a temp directory for frames
-    3. Saves frames as JPEG files
-    4. Returns immutable state
+    2. Extracts the frames as JPEG files into a directory of its own
+    3. Returns immutable state
 
     Args:
         video_frames: ComfyUI image tensor [N, H, W, C]
@@ -339,33 +440,30 @@ def create_video_state(
     import comfy.utils
 
     session_uuid = session_id if session_id else str(uuid.uuid4())
-    temp_dir = create_temp_dir(session_uuid)
 
-    # Save frames as JPEG
-    num_frames = video_frames.shape[0]
-    height = video_frames.shape[1]
-    width = video_frames.shape[2]
+    def extract(temp_dir):
+        num_frames = video_frames.shape[0]
+        log.info(f"Saving {num_frames} frames to {temp_dir}")
+        pbar = comfy.utils.ProgressBar(num_frames)
+        for i in range(num_frames):
+            comfy.model_management.throw_exception_if_processing_interrupted()
+            frame = video_frames[i].cpu().numpy()
+            # Convert from [H, W, C] float32 0-1 to uint8 0-255
+            frame = (frame * 255).astype(np.uint8)
+            img = Image.fromarray(frame)
+            img.save(os.path.join(temp_dir, f"{i:05d}.jpg"))
+            pbar.update(1)
+        log.info("Frames saved successfully")
+        return num_frames, video_frames.shape[1], video_frames.shape[2]
 
-    log.info(f"Saving {num_frames} frames to {temp_dir}")
-
-    pbar = comfy.utils.ProgressBar(num_frames)
-    for i in range(num_frames):
-        comfy.model_management.throw_exception_if_processing_interrupted()
-        frame = video_frames[i].cpu().numpy()
-        # Convert from [H, W, C] float32 0-1 to uint8 0-255
-        frame = (frame * 255).astype(np.uint8)
-        img = Image.fromarray(frame)
-        img.save(os.path.join(temp_dir, f"{i:05d}.jpg"))
-        pbar.update(1)
-
-    log.info("Frames saved successfully")
+    temp_dir = create_session_frames(session_uuid, extract)
 
     return SAM3VideoState(
         session_uuid=session_uuid,
         temp_dir=temp_dir,
-        num_frames=num_frames,
-        height=height,
-        width=width,
+        num_frames=video_frames.shape[0],
+        height=video_frames.shape[1],
+        width=video_frames.shape[2],
         config=config or VideoConfig(),
         prompts=(),
     )
@@ -380,7 +478,7 @@ def create_video_state_from_file(
     Create a new video state from a video file.
 
     Memory-efficient: extracts frames one at a time using cv2,
-    saving each as JPEG to a temp directory. Only 1 frame in RAM at a time.
+    saving each as JPEG. Only 1 frame in RAM at a time.
 
     Args:
         video_path: Path to video file (mp4, mov, avi, mkv, webm)
@@ -396,44 +494,53 @@ def create_video_state_from_file(
     import comfy.utils
 
     session_uuid = session_id if session_id else str(uuid.uuid4())
-    temp_dir = create_temp_dir(session_uuid)
 
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise ValueError(f"Could not open video file: {video_path}")
+    def extract(temp_dir):
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError(f"Could not open video file: {video_path}")
+        try:
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            log.info(f"Extracting frames from {video_path} ({total_frames} frames, {width}x{height})")
 
-    log.info(f"Extracting frames from {video_path} ({total_frames} frames, {width}x{height})")
+            pbar = comfy.utils.ProgressBar(total_frames)
+            frame_idx = 0
+            while True:
+                comfy.model_management.throw_exception_if_processing_interrupted()
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                # BGR -> RGB, save as JPEG (only 1 frame in RAM at a time)
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                img = PILImage.fromarray(frame_rgb)
+                img.save(os.path.join(temp_dir, f"{frame_idx:05d}.jpg"))
+                frame_idx += 1
+                pbar.update(1)
+        finally:
+            cap.release()
 
-    pbar = comfy.utils.ProgressBar(total_frames)
-    frame_idx = 0
-    while True:
-        comfy.model_management.throw_exception_if_processing_interrupted()
-        ret, frame = cap.read()
-        if not ret:
-            break
-        # BGR -> RGB, save as JPEG (only 1 frame in RAM at a time)
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img = PILImage.fromarray(frame_rgb)
-        img.save(os.path.join(temp_dir, f"{frame_idx:05d}.jpg"))
-        frame_idx += 1
-        pbar.update(1)
-    cap.release()
+        if frame_idx == 0:
+            raise ValueError(f"No frames could be read from video: {video_path}")
 
-    if frame_idx == 0:
-        raise ValueError(f"No frames could be read from video: {video_path}")
+        log.info(f"Extracted {frame_idx} frames to {temp_dir}")
+        return frame_idx, height, width
 
-    log.info(f"Extracted {frame_idx} frames to {temp_dir}")
+    info = {}
+
+    def extract_and_record(temp_dir):
+        info["num_frames"], info["height"], info["width"] = extract(temp_dir)
+
+    temp_dir = create_session_frames(session_uuid, extract_and_record)
 
     return SAM3VideoState(
         session_uuid=session_uuid,
         temp_dir=temp_dir,
-        num_frames=frame_idx,
-        height=height,
-        width=width,
+        num_frames=info["num_frames"],
+        height=info["height"],
+        width=info["width"],
         config=config or VideoConfig(),
         prompts=(),
     )

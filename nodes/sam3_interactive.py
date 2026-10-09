@@ -103,27 +103,18 @@ class SAM3PointCollector(io.ComfyNode):
 
     @classmethod
     def fingerprint_inputs(cls, **kwargs):
-        image = kwargs.get("image")
-        coordinates = kwargs.get("coordinates")
-        neg_coordinates = kwargs.get("neg_coordinates")
-
-        if image is None or coordinates is None or neg_coordinates is None:
-            # Called as a caching pre-check before this node's real inputs are
-            # resolved (e.g. upstream link not yet available this pass).
-            # Force a fresh execute() instead of crashing.
-            return float("nan")
-
-        # Return hash based on actual point content, not object identity
-        # This ensures downstream nodes don't re-run when points haven't changed
+        # ComfyUI calls this with widget values only: linked inputs such as
+        # `image` always arrive as None here.  It already includes the
+        # upstream connections and every widget value in its own cache key,
+        # so all this needs to do is return something STABLE.  The old code
+        # returned NaN (or crashed, which ComfyUI also turns into NaN) because
+        # image was None; NaN never equals itself, so this node and every
+        # SAM3 node downstream of it were treated as changed on every run.
         import hashlib
         h = hashlib.md5()
-        h.update(str(image.shape).encode())
-        h.update(coordinates.encode())
-        h.update(neg_coordinates.encode())
-        result = h.hexdigest()
-        log.debug(f"fingerprint_inputs SAM3PointCollector: shape={image.shape}, coords={coordinates}, neg_coords={neg_coordinates}")
-        log.debug(f"fingerprint_inputs SAM3PointCollector: returning hash={result}")
-        return result
+        h.update(str(kwargs.get("coordinates")).encode())
+        h.update(str(kwargs.get("neg_coordinates")).encode())
+        return h.hexdigest()
 
     @classmethod
     def execute(cls, image, points_store, coordinates, neg_coordinates,

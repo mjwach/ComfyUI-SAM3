@@ -30,6 +30,9 @@ from .video_state import (
     create_video_state,
     create_video_state_from_file,
     cleanup_temp_dir,
+    register_eviction_listener,
+    require_session_frames,
+    touch_session,
 )
 from .inference_reconstructor import (
     get_inference_state,
@@ -39,6 +42,23 @@ from .inference_reconstructor import (
 
 
 from .utils import print_mem, print_vram
+
+
+def _forget_video_session(session_uuid):
+    """Called by video_state just before a session's frames are deleted:
+    drop every cache entry and live inference state that refers to it."""
+    SAM3Propagate._cache = {
+        k: v for k, v in SAM3Propagate._cache.items() if k[0] != session_uuid
+    }
+    invalidate_session(session_uuid)
+    try:
+        from .sam3.predictor import Sam3VideoPredictor
+        session = Sam3VideoPredictor._ALL_INFERENCE_STATES.pop(session_uuid, None)
+        if session is not None:
+            del session
+            gc.collect()
+    except Exception as e:
+        log.debug(f"SAM3: could not close inference session {session_uuid[:8]}: {e}")
 
 
 # =============================================================================
@@ -65,9 +85,6 @@ class SAM3VideoSegmentation(io.ComfyNode):
     Note: SAM3 video does NOT support combining different prompt types.
     Each mode is mutually exclusive.
     """
-    # Class-level cache for video state results
-    _cache = {}
-
     PROMPT_MODES = ["text", "point", "box"]
 
     @classmethod
@@ -183,52 +200,11 @@ class SAM3VideoSegmentation(io.ComfyNode):
                 positive_boxes=None, negative_boxes=None,
                 frame_idx=0, score_threshold=0.3):
         """Initialize video state and add prompts based on selected mode."""
-        # Create cache key from inputs
-        import hashlib
+        # No private result cache: ComfyUI already decides when this node must
+        # re-run (by graph position and widget values) and caches its output.
+        # The old private cache keyed on a few corner pixels and on object
+        # addresses, which could hand one chain another chain's session.
         import os
-        h = hashlib.md5()
-
-        if video is not None:
-            try:
-                source = video.get_stream_source()
-                if isinstance(source, str):
-                    h.update(source.encode())
-                    try:
-                        h.update(str(os.path.getmtime(source)).encode())
-                        h.update(str(os.path.getsize(source)).encode())
-                    except OSError:
-                        pass
-                else:
-                    h.update(str(video.get_frame_count()).encode())
-                    h.update(str(video.get_dimensions()).encode())
-            except Exception:
-                h.update(str(id(video)).encode())
-        elif video_frames is not None:
-            h.update(str(video_frames.shape).encode())
-            first_frame = video_frames[0].cpu().numpy()
-            last_frame = video_frames[-1].cpu().numpy()
-            h.update(first_frame[0, 0, :].tobytes())
-            h.update(first_frame[-1, -1, :].tobytes())
-            h.update(last_frame[0, 0, :].tobytes())
-            h.update(last_frame[-1, -1, :].tobytes())
-
-        h.update(prompt_mode.encode())
-        h.update(text_prompt.encode())
-        h.update(str(id(positive_points)).encode() if positive_points else b"none")
-        h.update(str(id(negative_points)).encode() if negative_points else b"none")
-        h.update(str(id(positive_boxes)).encode() if positive_boxes else b"none")
-        h.update(str(id(negative_boxes)).encode() if negative_boxes else b"none")
-        h.update(str(frame_idx).encode())
-        h.update(str(score_threshold).encode())
-        cache_key = h.hexdigest()
-
-        # Check if we have cached result
-        if cache_key in SAM3VideoSegmentation._cache:
-            cached = SAM3VideoSegmentation._cache[cache_key]
-            log.info(f"CACHE HIT - returning cached video_state for key={cache_key[:8]}, session={cached['session_uuid'][:8]}")
-            return io.NodeOutput(cached)
-
-        log.info(f"CACHE MISS - computing new video_state for key={cache_key[:8]}")
         print_mem("Before video segmentation")
 
         # 1. Initialize video state from VIDEO object, image frames, or raise error
@@ -352,9 +328,7 @@ class SAM3VideoSegmentation(io.ComfyNode):
         log.info(f"Total prompts: {len(video_state.prompts)}")
         print_mem("After video segmentation")
 
-        # Cache and return as dict (JSON-safe for IPC)
         video_state_dict = video_state.to_dict()
-        SAM3VideoSegmentation._cache[cache_key] = video_state_dict
 
         return io.NodeOutput(video_state_dict)
 
@@ -413,7 +387,34 @@ class SAM3Propagate(io.ComfyNode):
         return result
 
     @classmethod
-    def execute(cls, sam3_model_config, video_state, start_frame=0, end_frame=-1, direction="forward"):
+    def execute(cls, sam3_model_config, video_state, **kwargs):
+        """Fail clearly if the frames are gone; otherwise propagate, then
+        close the tracking session.
+
+        The session's tracker state keeps per-frame memory features for every
+        object on the GPU (~1.5 MB/frame/object), and used to stay alive in
+        Sam3VideoPredictor._ALL_INFERENCE_STATES until the next propagation,
+        invisible to ComfyUI's memory management.  Nothing reuses it: the
+        reconstructor only holds it weakly, so every propagation rebuilds it
+        anyway, and the results are kept in SAM3Propagate._cache.
+        """
+        state = SAM3VideoState.from_dict(video_state)
+        require_session_frames(state)
+        try:
+            return cls._propagate(sam3_model_config, video_state, **kwargs)
+        finally:
+            try:
+                from .sam3.predictor import Sam3VideoPredictor
+                if Sam3VideoPredictor._ALL_INFERENCE_STATES.pop(state.session_uuid, None) is not None:
+                    gc.collect()
+                    import comfy.model_management
+                    comfy.model_management.soft_empty_cache()
+                    log.info(f"Closed tracking session {state.session_uuid[:8]} after propagation")
+            except Exception as e:
+                log.warning(f"SAM3: could not close tracking session: {e}")
+
+    @classmethod
+    def _propagate(cls, sam3_model_config, video_state, start_frame=0, end_frame=-1, direction="forward"):
         """Run propagation using reconstructed inference state."""
         import comfy.model_management
         import comfy.utils
@@ -552,7 +553,8 @@ class SAM3Propagate(io.ComfyNode):
         scores_out = {str(k): v for k, v in scores_dict.items()}
         video_state_dict = video_state.to_dict()
 
-        # Cache the result
+        # Cache only the most recent result (each entry holds a mask per frame).
+        SAM3Propagate._cache.clear()
         SAM3Propagate._cache[cache_key] = (masks_out, scores_out, video_state_dict)
 
         return io.NodeOutput(masks_out, scores_out, video_state_dict)
@@ -571,9 +573,6 @@ class SAM3VideoOutput(io.ComfyNode):
 
     Changing obj_id does NOT re-run propagation - only this node re-executes.
     """
-    # Class-level cache for extraction results
-    _cache = {}
-
     @classmethod
     def define_schema(cls):
         return io.Schema(
@@ -594,7 +593,10 @@ class SAM3VideoOutput(io.ComfyNode):
             ],
             outputs=[
                 io.Mask.Output(display_name="masks"),
-                io.Image.Output(display_name="frames"),
+                # Kept only so saved workflows' links (which are by output
+                # position) still line up; it now carries a 1x1 black placeholder.
+                io.Image.Output(display_name="frames (unused)",
+                                tooltip="No longer produced (was a JPEG-degraded copy of the input frames). Outputs a 1x1 black placeholder."),
                 io.Image.Output(display_name="visualization"),
             ],
         )
@@ -613,10 +615,17 @@ class SAM3VideoOutput(io.ComfyNode):
 
     @classmethod
     def execute(cls, masks, video_state, scores=None, obj_id=-1, plot_all_masks=True):
-        """Extract all masks as a batch [N, H, W] using memory-mapped streaming.
+        """Extract all masks as a batch [N, H, W], plus frames and visualization.
 
-        Uses numpy.memmap to write output directly to disk, avoiding OOM for large videos.
-        Memory usage is ~100MB regardless of video size (vs 32GB+ for 551 frames at 1080p).
+        Outputs are ordinary preallocated in-RAM tensors (anonymous memory, so
+        the kernel can swap them and frees them when the last reference goes).
+        This used to stream into numpy.memmap files in the session temp dir,
+        which on a RAM-backed /tmp was RAM that could not be swapped or freed,
+        and which crashed with SIGBUS when that filesystem filled up.
+        The "frames" output is no longer produced (it was only a JPEG-degraded
+        copy of the input); a 1x1 placeholder keeps the socket's position so
+        saved workflow links still line up.
+        Size: 16 bytes/pixel/frame (~33 MB per 1080p frame, was ~58 MB).
         """
         import comfy.model_management
         import comfy.utils
@@ -632,16 +641,11 @@ class SAM3VideoOutput(io.ComfyNode):
         if scores:
             scores = {int(k): v for k, v in scores.items()}
 
-        # Content-based cache key
-        cache_key = (video_state.session_uuid, len(masks) if masks else 0, obj_id, plot_all_masks)
-
-        # Check if we have cached result
-        if cache_key in SAM3VideoOutput._cache:
-            log.info(f"Video Output CACHE HIT - returning cached result for session={video_state.session_uuid[:8]}")
-            cached = SAM3VideoOutput._cache[cache_key]
-            return io.NodeOutput(cached[0], cached[1], cached[2])
-
-        log.info(f"Video Output CACHE MISS - streaming extraction for session={video_state.session_uuid[:8]}")
+        # No private result cache here: ComfyUI already caches node outputs in
+        # the main process, so a second copy in this process only doubled the
+        # (very large) memory footprint.
+        require_session_frames(video_state)
+        log.info(f"Video Output - extracting frames for session={video_state.session_uuid[:8]}")
         print_mem("Before extract")
         h, w = video_state.height, video_state.width
         num_frames = video_state.num_frames
@@ -650,28 +654,17 @@ class SAM3VideoOutput(io.ComfyNode):
             log.info("No masks to extract")
             empty_mask = torch.zeros(num_frames, h, w)
             empty_frames = torch.zeros(num_frames, h, w, 3)
-            return io.NodeOutput(empty_mask, empty_frames, empty_frames)
+            return io.NodeOutput(empty_mask, cls._frames_placeholder(), empty_frames)
 
-        # ============================================================
-        # STREAMING: Create memory-mapped files on disk
-        # Data is written directly to disk, not accumulated in RAM
-        # ============================================================
-        mmap_dir = os.path.join(video_state.temp_dir, "mmap_output")
-        os.makedirs(mmap_dir, exist_ok=True)
-
-        mask_path = os.path.join(mmap_dir, "masks.mmap")
-        frame_path = os.path.join(mmap_dir, "frames.mmap")
-        vis_path = os.path.join(mmap_dir, "vis.mmap")
-
-        # Create memory-mapped arrays (written to disk, not RAM)
-        mask_mmap = np.memmap(mask_path, dtype='float32', mode='w+',
-                              shape=(num_frames, h, w))
-        frame_mmap = np.memmap(frame_path, dtype='float32', mode='w+',
-                               shape=(num_frames, h, w, 3))
-        vis_mmap = np.memmap(vis_path, dtype='float32', mode='w+',
-                             shape=(num_frames, h, w, 3))
-
-        log.info(f"Streaming {num_frames} frames to disk: {mmap_dir}")
+        # Preallocate the outputs in ordinary RAM.  The *_buf names are numpy
+        # views sharing memory with the tensors, so the per-frame code below
+        # writes straight into the returned tensors with no extra copies.
+        gib = num_frames * h * w * 16 / 1024**3
+        log.info(f"Allocating {gib:.1f} GiB for {num_frames} output frames ({w}x{h})")
+        all_masks = torch.empty((num_frames, h, w), dtype=torch.float32)
+        all_vis = torch.empty((num_frames, h, w, 3), dtype=torch.float32)
+        mask_buf = all_masks.numpy()
+        vis_buf = all_vis.numpy()
 
         pbar = comfy.utils.ProgressBar(num_frames)
 
@@ -705,9 +698,6 @@ class SAM3VideoOutput(io.ComfyNode):
             else:
                 img_np = np.zeros((h, w, 3), dtype=np.float32)
                 img_tensor = torch.from_numpy(img_np)
-
-            # Write frame directly to mmap (no list accumulation!)
-            frame_mmap[frame_idx] = img_np
 
             # Get mask for this frame
             if frame_idx in masks:
@@ -799,44 +789,30 @@ class SAM3VideoOutput(io.ComfyNode):
                             frame_scores = list(frame_scores_tensor)
                     vis_frame = cls._draw_legend(vis_frame, num_objects, colors, obj_id=legend_obj_id, frame_scores=frame_scores)
 
-                # Write directly to mmap instead of appending to list
-                vis_mmap[frame_idx] = np.clip(vis_frame.numpy(), 0, 1)
-                mask_mmap[frame_idx] = frame_mask.cpu().numpy()
+                # Write straight into the output tensors
+                vis_buf[frame_idx] = np.clip(vis_frame.numpy(), 0, 1)
+                mask_buf[frame_idx] = frame_mask.cpu().numpy()
             else:
                 # No mask for this frame - use zeros
-                mask_mmap[frame_idx] = np.zeros((h, w), dtype=np.float32)
-                vis_mmap[frame_idx] = img_np
+                mask_buf[frame_idx] = np.zeros((h, w), dtype=np.float32)
+                vis_buf[frame_idx] = img_np
 
             pbar.update(1)
 
-            # Flush to disk periodically and free memory
             if frame_idx % 50 == 0 and frame_idx > 0:
-                mask_mmap.flush()
-                frame_mmap.flush()
-                vis_mmap.flush()
-                gc.collect()
                 log.info(f"Processed {frame_idx}/{num_frames} frames")
 
-        # Final flush
-        mask_mmap.flush()
-        frame_mmap.flush()
-        vis_mmap.flush()
-
-        # ============================================================
-        # Convert mmap to torch tensors (backed by disk, minimal RAM!)
-        # ============================================================
-        all_masks = torch.from_numpy(mask_mmap)
-        all_frames = torch.from_numpy(frame_mmap)
-        all_vis = torch.from_numpy(vis_mmap)
+        del mask_buf, vis_buf
 
         log.info(f"Output: {all_masks.shape[0]} masks, shape {all_masks.shape}")
         log.info(f"Objects tracked: {num_objects}, plot_all_masks: {plot_all_masks}")
         print_mem("After extract")
 
-        # Cache the result (tensors backed by mmap files - minimal RAM)
-        SAM3VideoOutput._cache[cache_key] = (all_masks, all_frames, all_vis)
+        return io.NodeOutput(all_masks, cls._frames_placeholder(), all_vis)
 
-        return io.NodeOutput(all_masks, all_frames, all_vis)
+    @staticmethod
+    def _frames_placeholder():
+        return torch.zeros((1, 1, 1, 3), dtype=torch.float32)
 
     @staticmethod
     def _draw_legend(vis_frame, num_objects, colors, obj_id=-1, frame_scores=None):
@@ -939,6 +915,9 @@ class SAM3VideoOutput(io.ComfyNode):
 # =============================================================================
 # Node Mappings
 # =============================================================================
+
+register_eviction_listener(_forget_video_session)
+
 
 NODE_CLASS_MAPPINGS = {
     "SAM3VideoSegmentation": SAM3VideoSegmentation,
