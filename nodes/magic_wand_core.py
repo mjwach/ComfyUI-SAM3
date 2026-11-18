@@ -37,6 +37,8 @@ equally well on GPU or CPU.
 import torch
 
 QUALITIES = ["color", "red", "green", "blue", "hue", "chroma", "lightness", "chrominance", "frame change"]
+# The block-size dropdown's choices.  Any other whole number > 0 also works
+# (it can arrive over a wire); nothing depends on these being powers of two.
 BLOCK_SIZES = [1, 2, 4, 8, 16, 32, 64]
 BLOCK_REDUCTIONS = ["max", "average", "min"]
 
@@ -302,6 +304,25 @@ def _as_rgb(t):
     return torch.stack([t[..., 0]] * 3, dim=-1)
 
 
+def validate_block_size(block_size):
+    """Return block_size as an int, or raise if it isn't a whole number > 0.
+
+    Accepts ints and integral floats (e.g. 3.0); rejects booleans, fractions,
+    zero, negatives and anything non-numeric.
+    """
+    ok = False
+    if isinstance(block_size, bool):
+        ok = False
+    elif isinstance(block_size, int):
+        ok = True
+    elif isinstance(block_size, float) and block_size.is_integer():
+        ok = True
+        block_size = int(block_size)
+    if not ok or block_size < 1:
+        raise ValueError(f"block_size must be a whole number greater than zero, got {block_size!r}")
+    return block_size
+
+
 def magic_wand(images, points, quality="color", full_tolerance=10.0, partial_tolerance=0.0,
                growth_threshold=0.5, block_size=1, block_reduction="max",
                apply_mask_threshold=False, mask_threshold=0.5, guide=None):
@@ -316,8 +337,7 @@ def magic_wand(images, points, quality="color", full_tolerance=10.0, partial_tol
     """
     if quality not in QUALITIES:
         raise ValueError(f"Unknown color quality: {quality!r}")
-    if block_size not in BLOCK_SIZES:
-        raise ValueError(f"block_size must be one of {BLOCK_SIZES}, got {block_size}")
+    block_size = validate_block_size(block_size)
     T, H, W = images.shape[0], images.shape[1], images.shape[2]
     if H % block_size or W % block_size:
         raise ValueError(

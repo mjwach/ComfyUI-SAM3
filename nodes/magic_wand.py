@@ -99,10 +99,17 @@ class MagicWandMask(io.ComfyNode):
                     tooltip="Full matches, and partial matches stronger than this, spread the selection to any "
                             "matching neighbor. Weaker partial matches only spread to neighbors that match no "
                             "more strongly than they do. Pixels with zero strength never spread."),
-                io.Combo.Input(
-                    "block_size", options=BLOCK_SIZES, default=1,
-                    tooltip="Size of the square blocks the output mask is quantized into. The input's width and "
-                            "height must be multiples of it."),
+                # A dropdown whose socket also accepts an INT wire, so sizes not in
+                # the list can be supplied from elsewhere in the graph.  ComfyUI does
+                # not range-check wired values, so magic_wand() validates them.
+                io.MultiType.Input(
+                    io.Combo.Input(
+                        "block_size", options=BLOCK_SIZES, default=1,
+                        tooltip="Size of the square blocks the output mask is quantized into. The input's width "
+                                "and height must be multiples of it. Pick a size here, or connect an INT wire "
+                                "to use any whole number greater than zero."),
+                    types=[io.Int],
+                ),
                 io.Combo.Input(
                     "block_reduction", options=BLOCK_REDUCTIONS, default="max",
                     tooltip="How each block's value is derived from its pixels' match strengths."),
@@ -150,7 +157,7 @@ class MagicWandMask(io.ComfyNode):
             full_tolerance=float(full_tolerance),
             partial_tolerance=float(partial_tolerance),
             growth_threshold=float(growth_threshold),
-            block_size=int(block_size),
+            block_size=block_size,  # validated (and converted) by magic_wand()
             block_reduction=block_reduction,
             apply_mask_threshold=bool(apply_mask_threshold),
             mask_threshold=float(mask_threshold),
